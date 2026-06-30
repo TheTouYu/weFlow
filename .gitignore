@@ -76,3 +76,7 @@ wechat-research-site
 .codex
 weflow-web-offical
 /Wedecrypt
+
+# Cache & secrets
+.npm-cache/
+wechat.key

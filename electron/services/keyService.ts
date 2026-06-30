@@ -842,13 +842,13 @@ export class KeyService {
     try {
       // 1. 查找模板文件获取密文和 XOR 密钥
       onProgress?.('正在查找模板文件...')
-      let result = await this._findTemplateData(userDir, 32)
+      let result = await this._findTemplateData(userDir, 32, onProgress)
       let { ciphertext, xorKey } = result
       
       // 如果找不到密钥，尝试扫描更多文件
       if (ciphertext && xorKey === null) {
         onProgress?.('未找到有效密钥，尝试扫描更多文件...')
-        result = await this._findTemplateData(userDir, 100)
+        result = await this._findTemplateData(userDir, 100, onProgress)
         xorKey = result.xorKey
       }
       
@@ -887,52 +887,212 @@ export class KeyService {
     }
   }
 
-  private async _findTemplateData(userDir: string, limit: number = 32): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
-    const { readdirSync, readFileSync, statSync } = await import('fs')
+  private async _findTemplateData(
+    userDir: string,
+    limit: number = 32,
+    onProgress?: (message: string) => void
+  ): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
+    const { readdirSync, statSync, openSync, closeSync, readSync } = await import('fs')
     const { join } = await import('path')
     const V2_MAGIC = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
 
-    // 递归收集 *_t.dat 文件
-    const collect = (dir: string, results: string[], maxFiles: number) => {
-      if (results.length >= maxFiles) return
-      try {
-        for (const entry of readdirSync(dir, { withFileTypes: true })) {
-          if (results.length >= maxFiles) break
-          const full = join(dir, entry.name)
-          if (entry.isDirectory()) collect(full, results, maxFiles)
-          else if (entry.isFile() && entry.name.endsWith('_t.dat')) results.push(full)
+    const normalizeXwechatScanBase = (dir: string): { normalized: string; isXwechatRoot: boolean } => {
+      const normalized = String(dir || '').replace(/\\/g, '/').replace(/\/+$/, '')
+      if (!normalized) return { normalized, isXwechatRoot: false }
+
+      const match = normalized.match(/^(.*\/xwechat_files\/[^/]+)(?:\/|$)/)
+      if (match) {
+        const base = match[1]
+        const accountId = base.split('/').pop()?.toLowerCase() || ''
+        if (accountId && accountId !== 'all_users' && accountId !== 'backup') {
+          return { normalized: base, isXwechatRoot: false }
         }
-      } catch { /* 忽略无权限目录 */ }
+      }
+
+      if (normalized.endsWith('/xwechat_files')) {
+        return { normalized, isXwechatRoot: true }
+      }
+
+      return { normalized, isXwechatRoot: false }
     }
 
-    const files: string[] = []
-    collect(userDir, files, limit)
+    const resolveScanRoots = (dir: string): string[] => {
+      const roots: string[] = []
+      const { normalized, isXwechatRoot } = normalizeXwechatScanBase(dir)
 
-    // 按修改时间降序
-    files.sort((a, b) => {
-      try { return statSync(b).mtimeMs - statSync(a).mtimeMs } catch { return 0 }
-    })
+      // 传入的是账号子目录（比如 db_storage/msg/...）时，先提升到账号根目录再扫描
+      if (!isXwechatRoot && normalized && normalized !== String(dir || '').replace(/\\/g, '/').replace(/\/+$/, '')) {
+        return [normalized]
+      }
+
+      if (!isXwechatRoot) return [normalized || dir]
+
+      // userDir 传的是 xwechat_files 根目录时，直接全量递归极慢且容易触发 MAX_ENTRIES 截断
+      // 优先只扫最近活跃的账号目录
+      try {
+        const entries = readdirSync(normalized, { withFileTypes: true })
+        const accountDirs = entries
+          .filter(e => e.isDirectory())
+          .map(e => e.name)
+          .filter(name => {
+            const lowered = name.toLowerCase()
+            if (!lowered) return false
+            if (lowered === 'all_users' || lowered === 'backup') return false
+            return lowered.startsWith('wxid_') || /^[a-f0-9]{32}$/.test(lowered)
+          })
+          .map(name => {
+            const full = join(normalized, name)
+            let mtimeMs = 0
+            try { mtimeMs = statSync(full).mtimeMs } catch { }
+            return { full, mtimeMs }
+          })
+          .sort((a, b) => b.mtimeMs - a.mtimeMs)
+          .slice(0, 3)
+
+        for (const item of accountDirs) roots.push(item.full)
+      } catch { /* ignore */ }
+
+      // 兜底：目录枚举失败时仍扫描根目录（但可能更慢）
+      if (roots.length === 0) roots.push(normalized)
+      return roots
+    }
+
+    const isTemplateDatName = (name: string): boolean => {
+      const lower = String(name || '').toLowerCase()
+      if (!lower.endsWith('.dat')) return false
+      const stem = lower.slice(0, -4)
+      // 纯 md5 作为文件名的 dat（常见图片资源命名）
+      if (/^[a-f0-9]{32}$/.test(stem)) return true
+      return (
+        stem.endsWith('_t') ||
+        stem.endsWith('.t') ||
+        stem.endsWith('_thumb') ||
+        // 微信新版在 cache/*/Message/*/Bubble 下常见 _b.dat，也可能携带 V2_MAGIC
+        stem.endsWith('_b') ||
+        stem.endsWith('.b') ||
+        // 高清/原图变体
+        stem.endsWith('_h') ||
+        stem.endsWith('.h') ||
+        stem.endsWith('_hd') ||
+        stem.endsWith('.hd')
+      )
+    }
+
+    // 递归扫描并按修改时间保留最新的 N 个模板候选
+    const candidates: Array<{ path: string; mtimeMs: number }> = []
+    const pushCandidate = (path: string) => {
+      let mtimeMs = 0
+      try { mtimeMs = statSync(path).mtimeMs } catch { return }
+
+      if (candidates.length < limit) {
+        candidates.push({ path, mtimeMs })
+        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+        return
+      }
+      const worst = candidates[candidates.length - 1]
+      if (worst && mtimeMs <= worst.mtimeMs) return
+
+      candidates.push({ path, mtimeMs })
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+      candidates.length = limit
+    }
+
+    const MAX_DIRS = 10_000
+    const MAX_ENTRIES = 300_000
+    let visitedDirs = 0
+    let visitedEntries = 0
+
+    const scanRoots = resolveScanRoots(userDir)
+    for (const root of scanRoots) {
+      const stack: string[] = [root]
+      while (stack.length > 0) {
+        const dir = stack.pop()!
+        visitedDirs++
+        if (visitedDirs > MAX_DIRS) break
+
+        let entries: any[] = []
+        try {
+          entries = readdirSync(dir, { withFileTypes: true })
+        } catch {
+          continue
+        }
+
+        for (const entry of entries) {
+          visitedEntries++
+          if (visitedEntries > MAX_ENTRIES) break
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) {
+            // 优先深入常见图片缓存目录，降低在大型目录下“扫不到关键文件”的概率
+            const name = String(entry.name || '').toLowerCase()
+            if (name === 'cache' || name === 'resource' || name === 'filestorage' || name === 'image' || name === 'image2' || name === 'message' || name === 'bubble' || name === 'msg') {
+              stack.push(full)
+            } else {
+              stack.unshift(full)
+            }
+          } else if (entry.isFile() && isTemplateDatName(entry.name)) {
+            pushCandidate(full)
+          }
+        }
+        if (visitedEntries > MAX_ENTRIES) break
+      }
+      if (visitedDirs > MAX_DIRS || visitedEntries > MAX_ENTRIES) break
+    }
+
+    const files = candidates.map(item => item.path)
 
     let ciphertext: Buffer | null = null
     const tailCounts: Record<string, number> = {}
+    let magicCount = 0
+    let magicExample: string | null = null
 
-    for (const f of files.slice(0, 32)) {
+    const readHeadAndTail = (filePath: string): { head: Buffer; tail: Buffer } | null => {
+      let fd: number | null = null
       try {
-        const data = readFileSync(f)
-        if (data.length < 8) continue
+        fd = openSync(filePath, 'r')
+        const headBuf = Buffer.alloc(0x1f)
+        const headBytes = readSync(fd, headBuf, 0, headBuf.length, 0)
+        if (headBytes < 8) return null
+
+        const st = statSync(filePath)
+        if (st.size < 2) return null
+        const tailBuf = Buffer.alloc(2)
+        const tailBytes = readSync(fd, tailBuf, 0, 2, Math.max(0, st.size - 2))
+        if (tailBytes !== 2) return null
+
+        return { head: headBuf.subarray(0, headBytes), tail: tailBuf }
+      } catch {
+        return null
+      } finally {
+        if (fd !== null) {
+          try { closeSync(fd) } catch { }
+        }
+      }
+    }
+
+    for (const f of files) {
+      try {
+        const io = readHeadAndTail(f)
+        if (!io) continue
+        const { head, tail } = io
 
         // 统计末尾两字节用于 XOR 密钥
-        if (data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 2) {
-          const key = `${data[data.length - 2]}_${data[data.length - 1]}`
+        if (head.subarray(0, 6).equals(V2_MAGIC)) {
+          magicCount++
+          if (!magicExample) magicExample = f
+          const key = `${tail[0]}_${tail[1]}`
           tailCounts[key] = (tailCounts[key] ?? 0) + 1
         }
 
         // 提取密文（取第一个有效的）
-        if (!ciphertext && data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 0x1F) {
-          ciphertext = data.subarray(0xF, 0x1F)
+        if (!ciphertext && head.subarray(0, 6).equals(V2_MAGIC) && head.length >= 0x1F) {
+          ciphertext = head.subarray(0xF, 0x1F)
         }
       } catch { /* 忽略 */ }
     }
+    onProgress?.(
+      `模板扫描: roots=${scanRoots.length} candidates=${files.length} magic=${magicCount}` +
+      (magicExample ? ` (例如: ${magicExample})` : '')
+    )
 
     // 计算 XOR 密钥
     let xorKey: number | null = null

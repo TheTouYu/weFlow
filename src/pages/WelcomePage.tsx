@@ -607,7 +607,7 @@ function WelcomePage({ standalone = false }: WelcomePageProps) {
     try {
       const wxids = await window.electronAPI.dbPath.scanWxids(dbPath)
       if (!Array.isArray(wxids) || wxids.length === 0) {
-        return '数据库目录步骤配置有误：当前目录下未找到可用账号数据（缺少 db_storage），请重新选择微信数据目录'
+        return '数据库目录步骤配置有误：当前目录下未找到可用账号数据（Windows 通常为 db_storage；macOS 微信 4.x 通常为包含 Message/Contact 的账号目录），请重新选择微信数据目录'
       }
     } catch (e) {
       return `数据库目录步骤配置有误：目录读取失败，请确认该路径可访问（${String(e)}）`

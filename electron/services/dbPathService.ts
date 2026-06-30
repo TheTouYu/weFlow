@@ -95,6 +95,9 @@ export class DbPathService {
       const home = homedir()
 
       if (process.platform === 'darwin') {
+        // macOS 经典路径优先：xwechat_files（图片/缓存等资源也在这里）
+        possiblePaths.push(join(home, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Documents', 'xwechat_files'))
+
         // macOS 微信 4.0.5+ 新路径（优先检测）
         const appSupportBase = join(home, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Library', 'Application Support', 'com.tencent.xinWeChat')
         if (existsSync(appSupportBase)) {
@@ -108,8 +111,6 @@ export class DbPathService {
             }
           } catch { }
         }
-        // macOS 旧路径兜底
-        possiblePaths.push(join(home, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Documents', 'xwechat_files'))
       } else {
         // Windows 微信4.x 数据目录
         possiblePaths.push(join(home, 'Documents', 'xwechat_files'))
@@ -170,10 +171,14 @@ export class DbPathService {
   }
 
   private isAccountDir(entryPath: string): boolean {
+    const hasMacNewLayout =
+      existsSync(join(entryPath, 'Message')) &&
+      (existsSync(join(entryPath, 'Contact')) || existsSync(join(entryPath, 'Session')))
     return (
       existsSync(join(entryPath, 'db_storage')) ||
       existsSync(join(entryPath, 'FileStorage', 'Image')) ||
-      existsSync(join(entryPath, 'FileStorage', 'Image2'))
+      existsSync(join(entryPath, 'FileStorage', 'Image2')) ||
+      hasMacNewLayout
     )
   }
 
@@ -194,6 +199,18 @@ export class DbPathService {
       if (existsSync(dbPath)) {
         const dbStat = statSync(dbPath)
         latest = Math.max(latest, dbStat.mtimeMs)
+      }
+
+      const messagePath = join(entryPath, 'Message')
+      if (existsSync(messagePath)) {
+        const messageStat = statSync(messagePath)
+        latest = Math.max(latest, messageStat.mtimeMs)
+      }
+
+      const contactPath = join(entryPath, 'Contact')
+      if (existsSync(contactPath)) {
+        const contactStat = statSync(contactPath)
+        latest = Math.max(latest, contactStat.mtimeMs)
       }
 
       const imagePath = join(entryPath, 'FileStorage', 'Image')
@@ -231,15 +248,21 @@ export class DbPathService {
           if (!stat.isDirectory()) continue
           const lower = entry.toLowerCase()
           if (lower === 'all_users') continue
+          if (this.isAccountDir(entryPath)) {
+            wxids.push({ wxid: entry, modifiedTime: stat.mtimeMs })
+            continue
+          }
           if (!entry.includes('_')) continue
           wxids.push({ wxid: entry, modifiedTime: stat.mtimeMs })
         }
       }
 
-
       if (wxids.length === 0) {
         const rootName = basename(resolvedRootPath)
-        if (rootName.includes('_') && rootName.toLowerCase() !== 'all_users') {
+        if (this.isAccountDir(resolvedRootPath) && rootName.toLowerCase() !== 'all_users') {
+          const rootStat = statSync(resolvedRootPath)
+          wxids.push({ wxid: rootName, modifiedTime: rootStat.mtimeMs })
+        } else if (rootName.includes('_') && rootName.toLowerCase() !== 'all_users') {
           const rootStat = statSync(resolvedRootPath)
           wxids.push({ wxid: rootName, modifiedTime: rootStat.mtimeMs })
         }
@@ -311,7 +334,11 @@ export class DbPathService {
   getDefaultPath(): string {
     const home = homedir()
     if (process.platform === 'darwin') {
-      // 优先返回 4.0.5+ 新路径
+      // 优先返回 xwechat_files（图片模板扫描等依赖此目录）
+      const legacy = join(home, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Documents', 'xwechat_files')
+      if (existsSync(legacy)) return legacy
+
+      // 4.0.5+ 新路径兜底
       const appSupportBase = join(home, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Library', 'Application Support', 'com.tencent.xinWeChat')
       if (existsSync(appSupportBase)) {
         try {
@@ -324,8 +351,7 @@ export class DbPathService {
           }
         } catch { }
       }
-      // 旧版本路径兜底
-      return join(home, 'Library', 'Containers', 'com.tencent.xinWeChat', 'Data', 'Documents', 'xwechat_files')
+      return legacy
     }
     return join(home, 'Documents', 'xwechat_files')
   }

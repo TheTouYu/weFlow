@@ -332,8 +332,8 @@ export class WcdbCore {
 
   private formatInitProtectionError(code: number): string {
     const messages: Record<number, string> = {
-      '-3001': '未找到数据库目录 (db_storage)，请确认已选择正确的微信数据目录（应包含以 wxid_ 开头的子文件夹）',
-      '-3002': '未找到 session.db 文件，请确认微信已登录并且数据目录完整',
+      '-3001': '未找到数据库目录，请确认已选择正确的微信数据目录（Windows 常见为 db_storage；macOS 微信 4.x 常见为包含 Message/Contact 的账号目录）',
+      '-3002': '未找到会话数据库文件（session.db / session_new.db），请确认微信已登录并且数据目录完整',
       '-3003': '数据库句柄无效，请重试',
       '-3004': '恢复数据库连接失败，请重试',
       '-2301': '动态库加载失败，请检查安装是否完整',
@@ -447,7 +447,7 @@ export class WcdbCore {
   }
 
   /**
-   * 递归查找 session.db 文件
+   * 递归查找会话数据库文件
    */
   private findSessionDb(dir: string, depth = 0): string | null {
     if (depth > 5) return null
@@ -456,7 +456,8 @@ export class WcdbCore {
       const entries = readdirSync(dir)
 
       for (const entry of entries) {
-        if (entry.toLowerCase() === 'session.db') {
+        const lower = entry.toLowerCase()
+        if (lower === 'session.db' || lower === 'session_new.db') {
           const fullPath = join(dir, entry)
           if (statSync(fullPath).isFile()) {
             return fullPath
@@ -474,10 +475,21 @@ export class WcdbCore {
         } catch { }
       }
     } catch (e) {
-      console.error('查找 session.db 失败:', e)
+      console.error('查找 session db 失败:', e)
     }
 
     return null
+  }
+
+  private looksLikeMacDbRoot(dir: string): boolean {
+    try {
+      return (
+        existsSync(join(dir, 'Message')) &&
+        (existsSync(join(dir, 'Contact')) || existsSync(join(dir, 'Session')))
+      )
+    } catch {
+      return false
+    }
   }
 
   private resolveDbStoragePath(basePath: string, wxid: string): string | null {
@@ -486,11 +498,21 @@ export class WcdbCore {
     if (normalized.toLowerCase().endsWith('db_storage') && existsSync(normalized)) {
       return normalized
     }
+
+    // macOS 微信 4.x 新目录结构：数据库直接位于账号目录下（含 Message/Contact 等），无需 db_storage
+    if (this.looksLikeMacDbRoot(normalized)) {
+      return normalized
+    }
+
     const direct = join(normalized, 'db_storage')
     if (existsSync(direct)) {
       return direct
     }
     if (wxid) {
+      const viaWxidRoot = join(normalized, wxid)
+      if (this.looksLikeMacDbRoot(viaWxidRoot)) {
+        return viaWxidRoot
+      }
       const viaWxid = join(normalized, wxid, 'db_storage')
       if (existsSync(viaWxid)) {
         return viaWxid
@@ -510,6 +532,10 @@ export class WcdbCore {
           return lowerEntry === lowerWxid || lowerEntry.startsWith(`${lowerWxid}_`)
         })
         for (const entry of candidates) {
+          const candidateRoot = join(normalized, entry)
+          if (this.looksLikeMacDbRoot(candidateRoot)) {
+            return candidateRoot
+          }
           const candidate = join(normalized, entry, 'db_storage')
           if (existsSync(candidate)) {
             return candidate

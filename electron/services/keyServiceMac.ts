@@ -1,6 +1,6 @@
 import { app, shell } from 'electron'
 import { join, basename, dirname } from 'path'
-import { existsSync, readdirSync, readFileSync, statSync, chmodSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, statSync, chmodSync, openSync, closeSync, readSync } from 'fs'
 import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
 import crypto from 'crypto'
@@ -630,7 +630,7 @@ export class KeyServiceMac {
         onStatus?.(`正在校验候选 wxid（${wxidCandidates.length} 个）...`)
         for (const candidateAccountPath of accountPathCandidates) {
           if (!existsSync(candidateAccountPath)) continue
-          const template = await this._findTemplateData(candidateAccountPath, 32)
+          const template = await this._findTemplateData(candidateAccountPath, 32, onStatus)
           if (!template.ciphertext) continue
 
           const accountDirWxid = basename(candidateAccountPath)
@@ -673,12 +673,12 @@ export class KeyServiceMac {
     try {
       // 1. 查找模板文件获取密文和 XOR 密钥
       onProgress?.('正在查找模板文件...')
-      let result = await this._findTemplateData(userDir, 32)
+      let result = await this._findTemplateData(userDir, 32, onProgress)
       let { ciphertext, xorKey } = result
       
       if (ciphertext && xorKey === null) {
         onProgress?.('未找到有效密钥，尝试扫描更多文件...')
-        result = await this._findTemplateData(userDir, 100)
+        result = await this._findTemplateData(userDir, 100, onProgress)
         xorKey = result.xorKey
       }
       
@@ -718,46 +718,214 @@ export class KeyServiceMac {
     }
   }
 
-  private async _findTemplateData(userDir: string, limit: number = 32): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
+  private async _findTemplateData(
+    userDir: string,
+    limit: number = 32,
+    onProgress?: (message: string) => void
+  ): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
     const V2_MAGIC = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
 
-    const collect = (dir: string, results: string[], maxFiles: number) => {
-      if (results.length >= maxFiles) return
-      try {
-        for (const entry of readdirSync(dir, { withFileTypes: true })) {
-          if (results.length >= maxFiles) break
-          const full = join(dir, entry.name)
-          if (entry.isDirectory()) collect(full, results, maxFiles)
-          else if (entry.isFile() && entry.name.endsWith('_t.dat')) results.push(full)
+    const normalizeXwechatScanBase = (dir: string): { normalized: string; isXwechatRoot: boolean } => {
+      const normalized = String(dir || '').replace(/\\/g, '/').replace(/\/+$/, '')
+      if (!normalized) return { normalized, isXwechatRoot: false }
+
+      // 微信 4.x（macOS 沙盒）新路径：Application Support/com.tencent.xinWeChat/<version>
+      // 图片模板 dat 文件仍在 Documents/xwechat_files 下，需自动映射
+      const sandboxMarker = '/Library/Containers/com.tencent.xinWeChat/Data'
+      const appSupportMarker = `${sandboxMarker}/Library/Application Support/com.tencent.xinWeChat`
+      if (normalized.includes(appSupportMarker)) {
+        const idx = normalized.indexOf(sandboxMarker)
+        if (idx >= 0) {
+          const base = normalized.slice(0, idx + sandboxMarker.length)
+          const mapped = `${base}/Documents/xwechat_files`
+          return { normalized: mapped, isXwechatRoot: true }
         }
-      } catch { }
+      }
+
+      const match = normalized.match(/^(.*\/xwechat_files\/[^/]+)(?:\/|$)/)
+      if (match) {
+        const base = match[1]
+        const accountId = base.split('/').pop()?.toLowerCase() || ''
+        if (accountId && accountId !== 'all_users' && accountId !== 'backup') {
+          return { normalized: base, isXwechatRoot: false }
+        }
+      }
+
+      if (normalized.endsWith('/xwechat_files')) {
+        return { normalized, isXwechatRoot: true }
+      }
+
+      return { normalized, isXwechatRoot: false }
     }
 
-    const files: string[] = []
-    collect(userDir, files, limit)
+    const resolveScanRoots = (dir: string): string[] => {
+      const roots: string[] = []
+      const { normalized, isXwechatRoot } = normalizeXwechatScanBase(dir)
 
-    files.sort((a, b) => {
-      try { return statSync(b).mtimeMs - statSync(a).mtimeMs } catch { return 0 }
-    })
+      if (!isXwechatRoot && normalized && normalized !== String(dir || '').replace(/\\/g, '/').replace(/\/+$/, '')) {
+        return [normalized]
+      }
+
+      if (!isXwechatRoot) return [normalized || dir]
+
+      try {
+        const entries = readdirSync(normalized, { withFileTypes: true })
+        const accountDirs = entries
+          .filter(e => e.isDirectory())
+          .map(e => e.name)
+          .filter(name => {
+            const lowered = String(name || '').toLowerCase()
+            if (!lowered) return false
+            if (lowered === 'all_users' || lowered === 'backup') return false
+            return lowered.startsWith('wxid_') || /^[a-f0-9]{32}$/.test(lowered)
+          })
+          .map(name => {
+            const full = join(normalized, name)
+            let mtimeMs = 0
+            try { mtimeMs = statSync(full).mtimeMs } catch { }
+            return { full, mtimeMs }
+          })
+          .sort((a, b) => b.mtimeMs - a.mtimeMs)
+          .slice(0, 3)
+
+        for (const item of accountDirs) roots.push(item.full)
+      } catch { }
+
+      if (roots.length === 0) roots.push(normalized)
+      return roots
+    }
+
+    const isTemplateDatName = (name: string): boolean => {
+      const lower = String(name || '').toLowerCase()
+      if (!lower.endsWith('.dat')) return false
+      const stem = lower.slice(0, -4)
+      if (/^[a-f0-9]{32}$/.test(stem)) return true
+      return (
+        stem.endsWith('_t') ||
+        stem.endsWith('.t') ||
+        stem.endsWith('_thumb') ||
+        stem.endsWith('_b') ||
+        stem.endsWith('.b') ||
+        stem.endsWith('_h') ||
+        stem.endsWith('.h') ||
+        stem.endsWith('_hd') ||
+        stem.endsWith('.hd')
+      )
+    }
+
+    // 递归扫描并按修改时间保留最新的 N 个模板候选
+    const candidates: Array<{ path: string; mtimeMs: number }> = []
+    const pushCandidate = (path: string) => {
+      let mtimeMs = 0
+      try { mtimeMs = statSync(path).mtimeMs } catch { return }
+
+      if (candidates.length < limit) {
+        candidates.push({ path, mtimeMs })
+        candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+        return
+      }
+
+      const worst = candidates[candidates.length - 1]
+      if (worst && mtimeMs <= worst.mtimeMs) return
+
+      candidates.push({ path, mtimeMs })
+      candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+      candidates.length = limit
+    }
+
+    const MAX_DIRS = 10_000
+    const MAX_ENTRIES = 300_000
+    let visitedDirs = 0
+    let visitedEntries = 0
+
+    const scanRoots = resolveScanRoots(userDir)
+    for (const root of scanRoots) {
+      const stack: string[] = [root]
+      while (stack.length > 0) {
+        const dir = stack.pop()!
+        visitedDirs++
+        if (visitedDirs > MAX_DIRS) break
+
+        let entries: any[] = []
+        try {
+          entries = readdirSync(dir, { withFileTypes: true })
+        } catch {
+          continue
+        }
+
+        for (const entry of entries) {
+          visitedEntries++
+          if (visitedEntries > MAX_ENTRIES) break
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) {
+            const name = String(entry.name || '').toLowerCase()
+            if (name === 'cache' || name === 'resource' || name === 'filestorage' || name === 'image' || name === 'image2' || name === 'message' || name === 'bubble' || name === 'msg') {
+              stack.push(full)
+            } else {
+              stack.unshift(full)
+            }
+          } else if (entry.isFile() && isTemplateDatName(entry.name)) {
+            pushCandidate(full)
+          }
+        }
+        if (visitedEntries > MAX_ENTRIES) break
+      }
+      if (visitedDirs > MAX_DIRS || visitedEntries > MAX_ENTRIES) break
+    }
+
+    const files = candidates.map(item => item.path)
 
     let ciphertext: Buffer | null = null
     const tailCounts: Record<string, number> = {}
+    let magicCount = 0
+    let magicExample: string | null = null
 
-    for (const f of files.slice(0, 32)) {
+    const readHeadAndTail = (filePath: string): { head: Buffer; tail: Buffer } | null => {
+      let fd: number | null = null
       try {
-        const data = readFileSync(f)
-        if (data.length < 8) continue
+        fd = openSync(filePath, 'r')
+        const headBuf = Buffer.alloc(0x1f)
+        const headBytes = readSync(fd, headBuf, 0, headBuf.length, 0)
+        if (headBytes < 8) return null
 
-        if (data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 2) {
-          const key = `${data[data.length - 2]}_${data[data.length - 1]}`
+        const st = statSync(filePath)
+        if (st.size < 2) return null
+        const tailBuf = Buffer.alloc(2)
+        const tailBytes = readSync(fd, tailBuf, 0, 2, Math.max(0, st.size - 2))
+        if (tailBytes !== 2) return null
+
+        return { head: headBuf.subarray(0, headBytes), tail: tailBuf }
+      } catch {
+        return null
+      } finally {
+        if (fd !== null) {
+          try { closeSync(fd) } catch { }
+        }
+      }
+    }
+
+    for (const f of files) {
+      try {
+        const io = readHeadAndTail(f)
+        if (!io) continue
+        const { head, tail } = io
+
+        if (head.subarray(0, 6).equals(V2_MAGIC)) {
+          magicCount++
+          if (!magicExample) magicExample = f
+          const key = `${tail[0]}_${tail[1]}`
           tailCounts[key] = (tailCounts[key] ?? 0) + 1
         }
 
-        if (!ciphertext && data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 0x1F) {
-          ciphertext = data.subarray(0xF, 0x1F)
+        if (!ciphertext && head.subarray(0, 6).equals(V2_MAGIC) && head.length >= 0x1F) {
+          ciphertext = head.subarray(0xF, 0x1F)
         }
       } catch { }
     }
+    onProgress?.(
+      `模板扫描: roots=${scanRoots.length} candidates=${files.length} magic=${magicCount}` +
+      (magicExample ? ` (例如: ${magicExample})` : '')
+    )
 
     let xorKey: number | null = null
     let maxCount = 0
